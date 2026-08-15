@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Why LLM Inference Is Expensive (Day 1)</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    html { -webkit-text-size-adjust: 100%; }
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Why LLM Inference Is Expensive (Day 1)</h1>
+</header>
+<h1
+id="why-llm-inference-is-expensive-prefill-decode-kv-cache-and-pagedattention-with-a-measured-baseline">Why
+LLM Inference Is Expensive: Prefill, Decode, KV-Cache, and
+PagedAttention (with a Measured Baseline)</h1>
+<p>Day 1 of my series on LLM inference optimization. By Yuvraj Singh
+Bhadoria.</p>
+<p>This is the part of AI engineering that is badly understaffed and, in
+my opinion, where a lot of real money is quietly saved or wasted. I am
+writing these as I learn, measuring everything instead of trusting
+marketing.</p>
+<h2 id="the-question">0. The question</h2>
+<p>When you send a prompt to an LLM, you pay for compute. But what
+exactly are you paying for? Why does a long answer cost more than a
+short question? And why is serving many users at once hard?</p>
+<p>To answer that, you have to understand two phases of generation, a
+cache, and how the serving system manages memory. Let’s go in order.</p>
+<h2 id="two-phases-prefill-and-decode">1. Two phases: Prefill and
+Decode</h2>
+<p>An LLM does not “answer” your prompt in one step. It runs in two
+distinct phases.</p>
+<p>Prefill reads your entire prompt (all N tokens) in parallel and
+produces the first output token, while saving the internal state it
+needs later. Decode then generates the answer one token at a time, each
+step looking at everything generated so far.</p>
+<figure>
+<img src="assets/prefill-decode-phases.png"
+alt="Prefill vs Decode: prompt enters prefill in parallel and produces the KV-cache, then sequential token generation during decode" />
+<figcaption aria-hidden="true">Prefill vs Decode: prompt enters prefill
+in parallel and produces the KV-cache, then sequential token generation
+during decode</figcaption>
+</figure>
+<p>Prefill is compute-bound (GPU busy). Decode is memory-bound (GPU
+waits on RAM). The word-by-word decode phase is where the bill comes
+from.</p>
+<p>My take: the speed you feel (tokens per second) is governed by
+decode, not prefill. When someone says “this model is slow,” they
+usually mean decode is slow, and decode is slow because of memory, not
+because the math is hard.</p>
+<h2 id="the-kv-cache-why-context-length-equals-memory">2. The KV-Cache:
+why context length equals memory</h2>
+<p>During decode, each new token must look at all previous tokens. To
+avoid recomputing, the model caches two vectors per token it has seen:
+Key (K) and Value (V). This is the KV-cache, and it lives in limited GPU
+memory.</p>
+<figure>
+<img src="assets/kv-cache-evolution.png"
+alt="KV-Cache: tokens produce K/V states that accumulate in GPU memory, growing with context length" />
+<figcaption aria-hidden="true">KV-Cache: tokens produce K/V states that
+accumulate in GPU memory, growing with context length</figcaption>
+</figure>
+<p>Longer conversation means more tokens means bigger KV-cache means
+more GPU memory. Context length is a memory problem, not just a compute
+problem.</p>
+<p>My take: at serving time the KV-cache is often what fills the GPU,
+not the model weights. That is why “support 100k context” is mostly an
+infrastructure promise.</p>
+<h2 id="batching-and-why-the-naive-version-wastes-memory">3. Batching:
+and why the naive version wastes memory</h2>
+<p>Serving one request at a time leaves the GPU idle between decode
+steps. Batching processes multiple requests together, but the naive
+implementation pads every request to the longest one and reserves
+max-length KV-cache for each, wasting memory that could hold more
+users.</p>
+<figure>
+<img src="assets/pagedattention-comparison.png"
+alt="Naive batching vs PagedAttention: large reserved KV regions with unused space versus dynamically allocated physical KV blocks via a block table" />
+<figcaption aria-hidden="true">Naive batching vs PagedAttention: large
+reserved KV regions with unused space versus dynamically allocated
+physical KV blocks via a block table</figcaption>
+</figure>
+<p>In the worst case (three tiny requests padded to a huge max), about
+98% of reserved cache is empty. Real traffic wastes less, often 20 to
+50%, but the principle holds: reserved memory you do not use is capacity
+you cannot sell.</p>
+<p>My take: reserving memory you do not use is like renting a warehouse
+and leaving it empty. You pay for it and cannot put customers in it.</p>
+<h2 id="pagedattention-vllm-the-fix">4. PagedAttention (vLLM): the
+fix</h2>
+<p>PagedAttention borrows virtual-memory paging from operating systems.
+Instead of one big reserved block per request, the KV-cache is split
+into small fixed-size blocks, allocated only as needed, anywhere in
+memory, tracked by a block table.</p>
+<p>The same illustration above (Naive vs PagedAttention) is the core
+idea: no fragmentation, continuous batching (finished requests free
+blocks instantly), and prefix sharing across users with the same system
+prompt. Result: far more concurrent users on the same hardware, which
+means higher throughput. This is the core idea behind vLLM.</p>
+<p>My take: PagedAttention does not make the attention math faster. It
+makes memory management efficient. A lot of “inference speedups” are
+actually memory-management wins. Debug a slow server by asking first
+whether you are memory-bound before blaming the model.</p>
+<h2 id="continuous-batching-scheduling-not-just-memory">5. Continuous
+batching: scheduling, not just memory</h2>
+<p>Static batching waits for the slowest request to finish before
+admitting new ones. Continuous (iteration-level) batching admits a new
+request the moment a slot frees and evicts finished ones
+immediately.</p>
+<figure>
+<img src="assets/continuous-vs-static-batching.png"
+alt="Continuous batching: a central GPU engine processing multiple request cards concurrently, finished requests exit and new ones enter the freed slots, with GPU utilization rising" />
+<figcaption aria-hidden="true">Continuous batching: a central GPU engine
+processing multiple request cards concurrently, finished requests exit
+and new ones enter the freed slots, with GPU utilization
+rising</figcaption>
+</figure>
+<p>Real measurements (always ask: versus what baseline, on what model,
+on what hardware): Anyscale reported vLLM about 23x over naive
+HuggingFace Transformers (OPT-13B, A100), roughly 2x over TGI, and Orca
+reported 36.9x over FasterTransformer (GPT-3 175B). None is universal,
+but the mechanism is durable: re-deciding the batch every decode step
+keeps the GPU full.</p>
+<p>My take: batching raises arithmetic intensity (weights loaded once,
+used for many sequences), pushing decode toward compute-bound. But
+larger batches raise per-request latency. Throughput and latency are
+traded, not both maximized.</p>
+<h2 id="my-measured-baseline">6. My measured baseline</h2>
+<p>Theory is cheap. Numbers are not. I installed vLLM on a Colab T4 GPU
+and measured actual throughput.</p>
+<p>Setup - Model: facebook/opt-125m - Hardware: NVIDIA Tesla T4 (15 GB)
+- Engine: vLLM 0.27.1, half precision - Method: 3 runs, 128 tokens each,
+temperature 0.7</p>
+<p>Result</p>
+<table>
+<thead>
+<tr>
+<th>Run</th>
+<th>Tokens</th>
+<th>Time (s)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>128</td>
+<td>0.39</td>
+</tr>
+<tr>
+<td>2</td>
+<td>128</td>
+<td>0.40</td>
+</tr>
+<tr>
+<td>3</td>
+<td>128</td>
+<td>0.46</td>
+</tr>
+<tr>
+<td>Avg</td>
+<td>128</td>
+<td>0.42</td>
+</tr>
+</tbody>
+</table>
+<p>That is about 308 tokens/sec. This is my “before” number, the decode
+speed of this model on this hardware, unoptimized beyond half-precision.
+Every technique I learn from here will be measured against it.</p>
+<p>Reproduce it:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> openai <span class="im">import</span> OpenAI</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>client <span class="op">=</span> OpenAI(base_url<span class="op">=</span><span class="st">&quot;http://localhost:8000/v1&quot;</span>, api_key<span class="op">=</span><span class="st">&quot;EMPTY&quot;</span>)</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>prompt <span class="op">=</span> <span class="st">&quot;The history of artificial intelligence is&quot;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>t0 <span class="op">=</span> time.time()</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>r <span class="op">=</span> client.completions.create(</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    model<span class="op">=</span><span class="st">&quot;facebook/opt-125m&quot;</span>,</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    prompt<span class="op">=</span>prompt,</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    max_tokens<span class="op">=</span><span class="dv">128</span>,</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    temperature<span class="op">=</span><span class="fl">0.7</span>,</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>((r.usage.completion_tokens) <span class="op">/</span> (time.time() <span class="op">-</span> t0), <span class="st">&quot;tok/s&quot;</span>)</span></code></pre></div>
+<p>My take on this number: ~308 tok/s is the speed of the whole round
+trip (HTTP, tokenization, GPU decode, sampling, serialization), not a
+pure GPU kernel number. So if quantization in Day 2 barely moves it,
+that may mean client overhead is hiding the gain, not that quantization
+failed. Know exactly what a benchmark is measuring.</p>
+<h2 id="takeaway">Takeaway</h2>
+<p>Inference cost is not magic. It comes down to three things:</p>
+<ol type="1">
+<li>Prefill vs decode. Decode (one token at a time) is the slow,
+memory-bound phase.</li>
+<li>KV-cache memory. Every token stored costs GPU RAM. Long context
+equals big cache.</li>
+<li>Batching efficiency. Naive batching wastes cache. Paged and
+continuous batching use it.</li>
+</ol>
+<p>Optimize those three and you cut the bill without touching model
+quality. That is the whole game of inference optimization.</p>
+<h2 id="day-1-summary">Day 1 summary</h2>
+<figure>
+<img src="assets/llm-pipeline-flow.png"
+alt="Day 1 summary: Prefill to Decode to KV Cache to Batching to PagedAttention, ending in higher GPU utilization and throughput" />
+<figcaption aria-hidden="true">Day 1 summary: Prefill to Decode to KV
+Cache to Batching to PagedAttention, ending in higher GPU utilization
+and throughput</figcaption>
+</figure>
+<h2 id="next-day-2">Next (Day 2)</h2>
+<p>Quantization. Shrink the model weights so each decode step loads less
+from memory, then re-measure. We will see if ~308 tok/s goes up, and be
+honest about how much of the gain is real versus measurement noise.</p>
+<h2 id="additional-diagrams">Additional diagrams</h2>
+<figure>
+<img src="assets/kv-cache-computation.png"
+alt="KV-cache Q·Kᵀ·V computation and caching" />
+<figcaption aria-hidden="true">KV-cache Q·Kᵀ·V computation and
+caching</figcaption>
+</figure>
+<figure>
+<img src="assets/pagedattention-blocktable.png"
+alt="PagedAttention block table: logical to physical blocks" />
+<figcaption aria-hidden="true">PagedAttention block table: logical to
+physical blocks</figcaption>
+</figure>
+<figure>
+<img src="assets/batching-types.png"
+alt="Static, dynamic, and continuous batching types" />
+<figcaption aria-hidden="true">Static, dynamic, and continuous batching
+types</figcaption>
+</figure>
+<figure>
+<img src="assets/naive-static-batching.png"
+alt="Naive / static batching" />
+<figcaption aria-hidden="true">Naive / static batching</figcaption>
+</figure>
+<h2 id="visual-references">Visual references</h2>
+<p>The diagrams in this article are original illustrations created for
+this series. Their technical concepts were informed by NVIDIA’s
+inference optimization material, the JAX Scaling Book’s inference
+chapter (MIT licensed), and the PagedAttention/vLLM work. Source images
+per component:</p>
+<ul>
+<li>Prefill vs Decode: NVIDIA KV-caching diagram
+(<code>developer-blogs.nvidia.com/wp-content/uploads/2023/11/key-value-caching_.png</code>);
+JAX <code>cached-inference.png</code>
+(<code>raw.githubusercontent.com/jax-ml/scaling-book/main/assets/img/cached-inference.png</code>).</li>
+<li>KV Cache: NVIDIA KV-caching diagram (above); JAX
+<code>naive-inference.png</code>
+(<code>raw.githubusercontent.com/jax-ml/scaling-book/main/assets/img/naive-inference.png</code>).</li>
+<li>Naive Batching vs PagedAttention: NVIDIA memory
+wastage/fragmentation
+(<code>developer-blogs.nvidia.com/wp-content/uploads/2023/11/memory-wastage-fragmentation-inefficient-kv-cache.png</code>);
+JAX <code>paged-attention.png</code>
+(<code>raw.githubusercontent.com/jax-ml/scaling-book/main/assets/img/paged-attention.png</code>).</li>
+<li>Continuous Batching: JAX <code>continuous-batching.gif</code>
+(<code>raw.githubusercontent.com/jax-ml/scaling-book/main/assets/img/continuous-batching.gif</code>);
+JAX <code>interleaving.png</code> and <code>disaggregation.png</code>
+(same path).</li>
+<li>Day 1 Summary: NVIDIA Dynamo architecture flow
+(<code>docs.dynamo.nvidia.com/dynamo/design-docs/architecture-flow</code>).</li>
+</ul>
+<h2 id="references">References</h2>
+<ul>
+<li>Kwon et al., vLLM: Easy, Fast, and Cheap LLM Serving with
+PagedAttention, 2023.</li>
+<li>Yu et al., Orca: A Generalization of Batch Processing for NLP
+Services, OSDI 2022.</li>
+<li>NVIDIA Tesla T4 datasheet.</li>
+<li>OPT model card, Meta AI / Hugging Face.</li>
+</ul>
+</body>
+</html>
