@@ -29,19 +29,15 @@ th,td { border:1px solid #e2e2e2; padding:12px 16px; text-align:left; }
 th { background:#f4f6f8; }
 ul,ol { padding-left:22px; }
 li { margin:6px 0; }
-</style></head><body><div class="hero"><div class="k">LLM Inference · Triton Kernels</div><h1>I Wrote the Three Attention Kernels That Run LLM Inference — in Portable Triton, on a Free Colab T4</h1><p>from-scratch prefill · split-KV decode · paged KV-cache attention — validated vs PyTorch SDPA</p></div><div class="wrap"><p>You finally get the request you&#x27;ve been waiting for: a 128K-token context window. Your GPU has 80 GB.</p>
-<p>The model weights take 16 GB. The rest should be plenty — until you do the math on the <strong>KV cache</strong> and</p>
-<p>realize it alone wants 17 GB, and that&#x27;s just <em>one</em> request at fp16. Add a batch and the GPU quietly</p>
-<p>tips over into out-of-memory.</p>
-<p>That cache is the part of LLM inference nobody talks about in the splashy benchmark posts. It&#x27;s the rent</p>
-<p>you pay on every token you&#x27;ve ever processed, and as context windows and batch sizes grow, it — not the</p>
-<p>weights — decides whether your workload fits. The good news: you can store that cache in 4-bit, even</p>
-<p>2-bit, and barely move the quality needle. The catch: round it the wrong way and attention silently</p>
-<p>falls apart.</p>
-<p>Most posts stop at &quot;use 4-bit, it&#x27;s fine.&quot; I didn&#x27;t want to trust that, so I loaded a real model</p>
-<p>(<strong>Qwen2.5-0.5B</strong>), pulled its actual KV-cache activations, quantized them four ways, and measured how</p>
-<p>badly each distorts attention. Here is what the numbers say — then how the three production schemes</p>
-<p>actually ship it.</p>
+</style></head><body><div class="hero"><div class="k">LLM Inference · Triton Kernels</div><h1>I Wrote the Three Attention Kernels That Run LLM Inference — in Portable Triton, on a Free Colab T4</h1><p>from-scratch prefill · split-KV decode · paged KV-cache attention — validated vs PyTorch SDPA</p></div><div class="wrap"><p>KV-cache quantization is one of the highest-leverage knobs in modern LLM inference. As context windows</p>
+<p>stretch past 128K tokens and batch sizes climb, the Key-Value cache — not the model weights — becomes the</p>
+<p>dominant memory consumer, quietly turning serving into a memory-bound problem. Storing that cache in 4-bit</p>
+<p>or 2-bit cuts its footprint 4–8× with minimal quality loss, but naive rounding collapses attention rather</p>
+<p>than compressing it.</p>
+<p>In this deep-dive I don&#x27;t take that on faith. I load a real model (<strong>Qwen2.5-0.5B</strong>), capture its actual</p>
+<p>KV-cache activations, quantize them four different ways, and measure exactly how each scheme distorts</p>
+<p>attention. Then I compare the three production schemes — <strong>KIVI</strong>, <strong>KVQuant</strong>, and <strong>GEAR</strong> — and show</p>
+<p>how to wire quantization into a real serving stack (vLLM / HuggingFace).</p>
 <h2>The Goal</h2>
 <p>By the end you should be able to answer:</p>
 <ul>
