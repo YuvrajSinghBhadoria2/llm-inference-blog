@@ -11,12 +11,12 @@ weights — decides whether your workload fits. The good news: you can store tha
 2-bit, and barely move the quality needle. The catch: round it the wrong way and attention silently
 falls apart.
 
-Most posts on this stop at "use 4-bit, it's fine." I didn't want to trust that, so I loaded a real model
-(**Qwen2.5-0.5B**), extracted its actual KV-cache activations, quantized them four different ways, and
-measured how badly each one distorts attention. This is what the numbers say — and then how the three
-production schemes actually ship it.
+Most posts stop at "use 4-bit, it's fine." I didn't want to trust that, so I loaded a real model
+(**Qwen2.5-0.5B**), pulled its actual KV-cache activations, quantized them four ways, and measured how
+badly each distorts attention. Here is what the numbers say — then how the three production schemes
+actually ship it.
 
-## The goal
+## The Goal
 
 By the end you should be able to answer:
 
@@ -25,6 +25,18 @@ By the end you should be able to answer:
 - Which scheme to reach for: **KIVI**, **KVQuant**, or **GEAR**.
 - How to wire it into a real serving stack (vLLM / HuggingFace).
 - How to compute the cache size for *your* model in 30 lines of Python.
+
+## Hardware & Experiment Setup
+
+Before the theory, the actual rig the numbers below come from:
+
+- **Model:** `Qwen/Qwen2.5-0.5B-Instruct` — 0.5B params, 24 layers, GQA (14 query / 2 KV heads), head_dim 64.
+- **Machine:** a CPU-only laptop (no GPU) — the point is you can reproduce this without a cluster.
+- **Prompt:** one 77-token real sentence, run through the model's forward pass.
+- **What we captured:** the *actual* Key and Value projections at every layer.
+- **What we measured:** relative attention-score error `‖A − Â‖ / ‖A‖` after quantizing the KV cache.
+
+No synthetic tensors, no "trust me" — the activations are the model's own.
 
 ## Component 1 — The cache is a tax that scales with tokens
 
@@ -58,15 +70,13 @@ KV cache is shuffled from main memory into SRAM for every generated token (KIVI,
 
 ## Component 2 — I measured the trap myself
 
-The obvious move is uniform, per-token quantization. That's also the mistake. To prove it instead of
-asserting it, I ran a real measurement:
+The obvious move is uniform, per-token quantization. That's also the mistake. Here is the experiment, end
+to end:
 
-- Loaded **Qwen2.5-0.5B** (24 layers, GQA 14 query / 2 KV heads, head_dim 64).
-- Ran a 77-token real prompt through it and captured the **actual** K and V projections per layer.
-- Fake-quantized the KV cache at **2-bit and 4-bit** under four schemes, then recomputed attention
-  scores `A = softmax(QKᵀ/√d)` and measured the relative error `‖A − Â‖ / ‖A‖`.
+![How we measured the trap](assets/exp_flow.png)
 
-Here is the measured attention-score error:
+I fake-quantized the captured KV cache at **2-bit and 4-bit** under four schemes, recomputed attention
+scores, and measured the error. The bar chart is the measured result:
 
 ![Measured KV-cache quantization error on Qwen2.5-0.5B](assets/real_attn_err.png)
 
@@ -115,6 +125,8 @@ the bit-width.
 | **KVQuant** (NeurIPS'24) | pre-RoPE per-channel K, non-uniform, dense-and-sparse (1% outliers) | 3 | **<0.1 perplexity drop** (WikiText-2, C4) | 4.8× compression; LLaMA-7B at **1M ctx on 1× A100**, 10M on 8× GPU; ~1.7× matvec speedup |
 | **GEAR** (ICML'24) | quantization + low-rank error + sparse outliers | 2 | near-lossless; up to **24.4% over SOTA** at 2-bit | 2.39× peak mem, **2.1–5.07× throughput** |
 
+![Memory saved vs throughput at a glance](assets/bench.png)
+
 - **KIVI is the pragmatic default.** Tuning-free, plug-and-play, ships as a HuggingFace wrapper. The
   full-precision window for the most recent tokens rescues hard reasoning — without it, fake 2-bit on
   GSM8K craters.
@@ -130,22 +142,29 @@ the bit-width.
 > head) needs 4-bit, not 2-bit** — MQA is already so compressed there's no redundancy left to trade. If
 > your model uses MQA, don't assume 2-bit works.
 
-## Component 4 — How it fits in a real serving stack
+## Component 4 — Serving architecture & manifests
 
 This isn't a research curiosity you bolt on by hand — it slots into the paged-memory path every modern
 server already runs:
 
 ![KV-cache quantization in a serving stack](assets/kv_serve.png)
 
-In practice you rarely write the kernel yourself. Two drop-in paths:
+For the long-context frontier, KVQuant and GEAR ship CUDA kernels that fuse dequant into the matmul —
+without that fusion, the quantization overhead eats the memory win. In practice you rarely write the kernel
+yourself; two drop-in paths:
 
-**vLLM (fp8 KV cache — the safe default today):**
+**vLLM — fp8 KV cache (the safe default today):**
+```yaml
+# vllm serve config
+model: meta-llama/Llama-3-8B-Instruct
+kv_cache_dtype: fp8_e5m2        # 2x smaller KV, near-lossless
+max_model_len: 131072
+gpu_memory_utilization: 0.85
+```
 ```bash
-# 2x smaller KV cache, near-lossless, hardware-accelerated on Hopper/Ada
 python -m vllm.entrypoints.openai.api_server \
   --model meta-llama/Llama-3-8B-Instruct \
-  --kv-cache-dtype fp8_e5m2 \
-  --max-model-len 131072
+  --kv-cache-dtype fp8_e5m2 --max-model-len 131072
 ```
 
 **HuggingFace + KIVI (research-grade 2-bit):**
@@ -156,9 +175,6 @@ config.group_size = 64
 config.residual_length = 64                    # recent tokens kept fp16
 model = LlamaForCausalLM_KIVI.from_pretrained("meta-llama/Llama-2-7b-hf", config=config)
 ```
-
-For the long-context frontier, KVQuant and GEAR ship CUDA kernels that fuse dequant into the matmul —
-without that fusion, the quantization overhead eats the memory win.
 
 ## Where it still breaks
 
@@ -197,13 +213,14 @@ Run it and you get the figures in this post. That's the question KV-cache quanti
 
 KV-cache quantization is the rare optimization that's both mathematically simple and empirically subtle.
 The win is real and large — **4–8× memory, 2–5× throughput** — but it's earned by respecting the cache's
-outlier structure, not by rounding harder. I measured it directly: naive per-token quantization distorts
-attention ~1.3× more than the per-channel key scheme on a real 0.5B model, and the gap is wider on bigger
-ones. For most teams the right move today is **fp8 in the serving stack**; for the long-context frontier,
-**KVQuant** and **GEAR** show 2–3-bit caches are deployable, not research curiosities.
+outlier structure, not by rounding harder. I measured it directly on a real 0.5B model: naive per-token
+quantization distorts attention ~1.3× more than the per-channel key scheme, and the gap is wider on bigger
+models. For most teams the right move today is **fp8 in the serving stack**; for the long-context
+frontier, **KVQuant** and **GEAR** show 2–3-bit caches are deployable, not research curiosities.
 
-Next up: I'll break down **speculative decoding** the same way — where the famous 2–3× claim actually
-holds, and where it quietly loses.
+I started this wanting to *understand* why my 128K requests kept OOMing, and ended up rebuilding the cache
+path from the outlier math up. Next up: I'll break down **speculative decoding** the same way — where the
+famous 2–3× claim actually holds, and where it quietly loses.
 
 ## References
 
