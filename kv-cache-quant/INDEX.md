@@ -33,6 +33,8 @@ Before the theory, the actual rig the numbers below come from:
 
 No synthetic tensors, no "trust me" — the activations are the model's own.
 
+![Complete architecture of the Qwen2.5-0.5B model used in this experiment](assets/diagram_qwen_arch.png)
+
 ## Component 1 — The cache is a tax that scales with tokens
 
 Every transformer layer keeps the Key and Value vectors of every token it has seen, so attention doesn't
@@ -45,7 +47,7 @@ KV_bytes = 2 · n_layers · n_kv_heads · head_dim · bytes_per_elem · seq_len 
 For **Llama-3-8B** (32 layers, 8 KV heads, head_dim 128) that's **128 KiB per token at fp16**, and it
 grows linearly with both sequence length and batch. The picture below is the whole problem in one frame.
 
-![Why the KV cache is the bottleneck](assets/kv_flow.png)
+![Why context length causes OOM: weights vs KV-cache memory growth](assets/diagram_memory_wall.png)
 
 | Context (tokens) | fp16   | 8-bit | 4-bit | 2-bit |
 |------------------|--------|-------|-------|-------|
@@ -68,7 +70,7 @@ KV cache is shuffled from main memory into SRAM for every generated token (KIVI,
 The obvious move is uniform, per-token quantization. That's also the mistake. Here is the experiment, end
 to end:
 
-![How we measured the trap](assets/exp_flow.png)
+![End-to-end KV-cache quantization workflow](assets/diagram_workflow.png)
 
 I fake-quantized the captured KV cache at **2-bit and 4-bit** under four schemes, recomputed attention
 scores, and measured the error. The bar chart is the measured result:
@@ -94,7 +96,7 @@ Why? Look at the distribution. Keys have a few **fixed outlier channels** (same 
 values have no such pattern but are mixed by attention into the output. So keys want per-channel
 quantization, values want per-token. Uniform quantization ignores that and pays for it.
 
-![Keys and values must be quantized differently](assets/kv_asym.png)
+![Asymmetric outlier structure: why per-token round() fails vs per-channel](assets/diagram_asymmetric.png)
 
 The whole asymmetric scheme in a dozen lines:
 
@@ -122,6 +124,8 @@ the bit-width.
 
 ![Memory saved vs throughput at a glance](assets/bench.png)
 
+![How KIVI, KVQuant, and GEAR decompose the KV tensor](assets/diagram_schemes.png)
+
 - **KIVI is the pragmatic default.** Tuning-free, plug-and-play, ships as a HuggingFace wrapper. The
   full-precision window for the most recent tokens rescues hard reasoning — without it, fake 2-bit on
   GSM8K craters.
@@ -142,7 +146,7 @@ the bit-width.
 This isn't a research curiosity you bolt on by hand — it slots into the paged-memory path every modern
 server already runs:
 
-![KV-cache quantization in a serving stack](assets/kv_serve.png)
+![Serving layer: quantized KV blocks mapped to paged memory in vLLM](assets/diagram_serving.png)
 
 For the long-context frontier, KVQuant and GEAR ship CUDA kernels that fuse dequant into the matmul —
 without that fusion, the quantization overhead eats the memory win. In practice you rarely write the kernel
