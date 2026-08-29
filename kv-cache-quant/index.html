@@ -1,0 +1,175 @@
+<!doctype html><html><head><meta charset=utf-8><style>
+* { box-sizing:border-box; }
+body { margin:0; background:#fbfbfa; color:#1a1a1a; font:19px/1.8 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+.hero { background:#fff; color:#1a1a1a; padding:44px 22px 26px; text-align:left; border-bottom:3px solid #2D8CFF; max-width:740px; margin:0 auto; }
+.hero .k { font:13px/1 'SF Mono',Menlo,monospace; color:#2D8CFF; letter-spacing:2px; text-transform:uppercase; }
+.hero h1 { font:34px/1.25 -apple-system,Segoe UI,Roboto,sans-serif; max-width:740px; margin:14px 0 8px; color:#0f1115; }
+.hero p { color:#555; font:16px -apple-system,sans-serif; margin:0; max-width:740px; }
+.wrap { max-width:740px; margin:0 auto; padding:38px 22px 80px; }
+h2 { font:28px -apple-system,Segoe UI,sans-serif; margin:46px 0 14px; padding-bottom:8px; border-bottom:2px solid #ececec; }
+h3 { font:23px -apple-system,Segoe UI,sans-serif; margin:34px 0 10px; }
+h1 { font:33px -apple-system,sans-serif; }
+figure { width:min(1000px,94vw); margin:36px auto; position:relative; left:50%; transform:translateX(-50%); }
+figure img { width:100%; border:1px solid #e7e7e7; border-radius:10px; box-shadow:0 6px 22px rgba(0,0,0,.07); background:#fff; }
+figcaption { text-align:center; color:#777; font:13px -apple-system,sans-serif; margin-top:9px; }
+pre { background:#f6f8fa; color:#24292f; padding:18px; border-radius:9px; overflow:auto; border:1px solid #e2e2e2; font:14.5px 'SF Mono',Menlo,monospace; line-height:1.6; }
+pre .c { color:#008000; font-style:italic; }
+pre .s { color:#a31515; }
+pre .d { color:#af00db; }
+pre .n { color:#098658; }
+pre .k { color:#0000ff; font-weight:600; }
+pre .fn { color:#795e26; }
+pre .at { color:#795e26; }
+code { background:#eef0f2; padding:2px 5px; border-radius:4px; font:14px 'SF Mono',Menlo,monospace; color:#cf222e; }
+pre code { background:none; padding:0; color:#24292f; }
+blockquote { background:#fff8e6; border-left:5px solid #f0c000; padding:12px 18px; margin:22px 0; color:#5b4b00; font-size:16px; border-radius:0 8px 8px 0; }
+a { color:#2D8CFF; }
+table { border-collapse:collapse; width:100%; margin:22px 0; font:16.5px -apple-system,sans-serif; }
+th,td { border:1px solid #e2e2e2; padding:12px 16px; text-align:left; }
+th { background:#f4f6f8; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+</style></head><body><div class="hero"><div class="k">LLM Inference · Triton Kernels</div><h1>I Wrote the Three Attention Kernels That Run LLM Inference — in Portable Triton, on a Free Colab T4</h1><p>from-scratch prefill · split-KV decode · paged KV-cache attention — validated vs PyTorch SDPA</p></div><div class="wrap"><p>Every token an LLM generates, it pays rent. Not to the weights — those are loaded once — but to the</p>
+<p><strong>KV cache</strong>: the stored Key and Value vectors from every previous token that attention needs to avoid</p>
+<p>recomputing. As context windows stretched from 4K to 128K and beyond, that rent became the dominant</p>
+<p>line item in inference cost. On long prompts it is no longer the weights that decide whether a request</p>
+<p>fits on the GPU — it is the cache.</p>
+<p>The obvious lever is quantization: store the cache in 4-bit or 2-bit instead of fp16. But the KV cache</p>
+<p>is not a passive buffer you can round carelessly. Get the scheme wrong and attention silently collapses.</p>
+<p>Get it right and you can shrink the cache 4–8× with perplexity unchanged. This post walks through why</p>
+<p>naive quantization fails, what the leading methods actually do, how far the wins go, and where the</p>
+<p>technique still breaks — with numbers pulled from primary papers and a small computation you can</p>
+<p>reproduce yourself.</p>
+<h2>The problem, in bytes</h2>
+<p>The KV cache holds, for every layer, the K and V projections of every token processed so far. Its size</p>
+<p>is:</p>
+<pre><code>KV_bytes = <span class="n">2</span> · n_layers · n_kv_heads · head_dim · bytes_per_elem · seq_len · batch</code></pre>
+<p>For <strong>Llama-3-8B</strong> (32 layers, 8 KV heads via GQA, head_dim 128), that is <strong>128 KiB per token at fp16</strong>.</p>
+<p>Linear in both sequence length and batch. Here is what that means in practice:</p>
+<table><thead><tr><th>Context (tokens)</th><th>fp16</th><th>8-bit</th><th>4-bit</th><th>2-bit</th></tr></thead><tbody><tr><td>4,096</td><td>0.54 GB</td><td>0.27 GB</td><td>0.13 GB</td><td>0.07 GB</td></tr><tr><td>8,192</td><td>1.07 GB</td><td>0.54 GB</td><td>0.27 GB</td><td>0.13 GB</td></tr><tr><td>32,768</td><td>4.29 GB</td><td>2.15 GB</td><td>1.07 GB</td><td>0.54 GB</td></tr><tr><td>131,072</td><td>17.18 GB</td><td>8.59 GB</td><td>4.29 GB</td><td>2.15 GB</td></tr></tbody></table>
+<figure><a href="assets/kv_memory.png" target="_blank"><img src="assets/kv_memory.png"></a></figure>
+<p>Now multiply by batch. At <strong>64 concurrent requests and 32K context</strong>, a single fp16 cache is <strong>~275 GB</strong> —</p>
+<p>far past any single GPU. Even 4-bit leaves <strong>~69 GB</strong>. This is why throughput on long-context servers is</p>
+<p>memory-bound, not compute-bound: the GPU&#x27;s compute units sit idle while the KV cache is shuttled from</p>
+<p>main memory into SRAM for every generated token (KIVI, ICML 2024).</p>
+<blockquote>[!WARNING] Memory-bound ≠ free lunch. Cutting the cache&#x27;s footprint raises <em>how many requests you can batch</em>, which raises throughput — but only if your serving stack actually supports KV quantization end to end (paged allocation, dequant at the matmul, correct calibration). Quantizing the tensor but not the memory manager gets you neither the memory win nor the speedup.</blockquote>
+<h2>Why naive quantization fails</h2>
+<p>The first instinct — uniform, per-token quantization of every K/V vector — is quietly catastrophic.</p>
+<p>The reason is in the <em>distribution</em> of the cache, not the arithmetic:</p>
+<ul>
+<li><strong>Keys have persistent per-channel outliers.</strong> A few fixed channels carry very large magnitudes across</li>
+</ul>
+<p>  all tokens (consistent with the activation-outlier findings in LLM.int8() and AWQ). Quantizing keys</p>
+<p>  <em>per-token</em> smears those outliers into every other channel.</p>
+<ul>
+<li><strong>Values have no such pattern</strong>, but they are mixed by attention into the output, so the error couples</li>
+</ul>
+<p>  across tokens. Quantizing values <em>per-channel</em> lets one token&#x27;s error leak into another&#x27;s.</p>
+<p>KIVI measured the consequence directly: per-token key quantization produces nearly **5× larger attention</p>
+<p>score error<strong> than per-channel key quantization, and per-channel value quantization is </strong>~15× worse** than</p>
+<p>per-token. The fix is asymmetric and non-obvious — <strong>quantize keys per-channel, values per-token</strong> — and</p>
+<p>that single insight is what makes 2-bit KV cache viable.</p>
+<p>A minimal sketch of the right scheme:</p>
+<pre><code><span class="c"># Asymmetric KV quantization (KIVI-style)</span>
+<span class="k">def</span> <span class="fn">quantize_key_per_channel</span>(K, bits=<span class="n">2</span>):
+    <span class="c"># K: [n_kv_heads, seq, head_dim] -&gt; scale per channel (head_dim dim)</span>
+    scale = K<span class="at">.abs</span>()<span class="at">.amax</span>(-<span class="n">1</span>, keepdim=<span class="k">True</span>) / (<span class="n">2</span>**bits - <span class="n">1</span>)
+    <span class="k">return</span> <span class="fn">round</span>(K / scale)<span class="at">.clamp</span>(...), scale        <span class="c"># dequant: Q * scale</span>
+
+<span class="k">def</span> <span class="fn">quantize_value_per_token</span>(V, bits=<span class="n">2</span>):
+    <span class="c"># V: [n_kv_heads, seq, head_dim] -&gt; scale per token (seq dim)</span>
+    scale = V<span class="at">.abs</span>()<span class="at">.amax</span>(-<span class="n">2</span>, keepdim=<span class="k">True</span>) / (<span class="n">2</span>**bits - <span class="n">1</span>)
+    <span class="k">return</span> <span class="fn">round</span>(V / scale)<span class="at">.clamp</span>(...), scale</code></pre>
+<h2>What the leading methods actually do</h2>
+<p>Three papers define the modern frontier. They agree on the outlier structure and diverge on how hard they</p>
+<p>push the bit-width.</p>
+<table><thead><tr><th>Method</th><th>Scheme</th><th>Bits</th><th>Quality</th><th>Memory / throughput win</th></tr></thead><tbody><tr><td><strong>KIVI</strong> (ICML&#x27;24)</td><td>per-channel K, per-token V; recent tokens kept fp16 (&quot;residual window&quot;)</td><td>2</td><td>~2% drop on Llama-2/Mistral (GSM8K); Falcon needs 4-bit</td><td>2.6× peak mem (incl. weights), 4× larger batch, <strong>2.35–3.47× throughput</strong></td></tr><tr><td><strong>KVQuant</strong> (NeurIPS&#x27;24)</td><td>pre-RoPE per-channel K, non-uniform (NUQ), dense-and-sparse (1% outliers)</td><td>3</td><td><strong>&lt;0.1 perplexity drop</strong> (WikiText-2, C4)</td><td>4.8× compression; serves LLaMA-7B at <strong>1M ctx on 1× A100-80GB</strong>, 10M on 8× GPU; ~1.7× matvec speedup</td></tr><tr><td><strong>GEAR</strong> (ICML&#x27;24)</td><td>quantization + low-rank error approx + sparse outliers</td><td>2</td><td>near-lossless; up to <strong>24.4% accuracy gain</strong> over SOTA baselines at 2-bit</td><td>2.39× peak mem, <strong>2.1–5.07× throughput</strong></td></tr></tbody></table>
+<p>A few things worth pulling out:</p>
+<ul>
+<li><strong>KIVI is the practical baseline.</strong> It is tuning-free, plug-and-play, and ships as a drop-in HuggingFace</li>
+</ul>
+<p>  wrapper. The residual (full-precision) window for the most recent tokens is what rescues hard reasoning</p>
+<p>  tasks — without it, fake 2-bit quantization on GSM8K craters.</p>
+<ul>
+<li><strong>KVQuant is the &quot;go long&quot; play.</strong> By quantizing <em>before</em> RoPE (which otherwise mixes outlier channels)</li>
+</ul>
+<p>  and using sensitivity-weighted non-uniform codebooks plus a 1% sparse outlier store, it reaches 3-bit</p>
+<p>  with sub-0.1 perplexity loss and turns context length from a memory wall into a tunable dial.</p>
+<ul>
+<li><strong>GEAR is the &quot;go low&quot; play.</strong> Rather than fight residuals, it models them: a low-rank matrix recovers</li>
+</ul>
+<p>  the coherent part of the quantization error and a sparse matrix catches the rest. It augments any base</p>
+<p>  quantizer (KIVI, KCVT) and is the only one of the three that stays near-lossless at 2-bit on complex</p>
+<p>  generation.</p>
+<blockquote>[!WARNING] These numbers are method-specific, not universal. KIVI reports that **Falcon-7B (multi-query attention, a single KV head) needs 4-bit**, not 2-bit, because MQA is already so compressed that there is no redundancy left to trade. If your model uses MQA, do not assume 2-bit works.</blockquote>
+<h2>Where it still breaks</h2>
+<p>Quantizing the KV cache is mature but not magic. The honest failure modes:</p>
+<ol>
+<li><strong>Small models + long context are the danger zone.</strong> Perplexity degradation grows as you shrink the</li>
+</ol>
+<p>   model and lengthen the prompt; the headroom that hides quantization error in a 70B model does not exist</p>
+<p>   in a 7B one.</p>
+<ol>
+<li><strong>Reasoning tasks are unforgiving.</strong> GSM8K-style math is where fake quantization fails hardest; the</li>
+</ol>
+<p>   full-precision recent-token window (KIVI) or low-rank residual (GEAR) is not optional.</p>
+<ol>
+<li><strong>Throughput only follows if the kernel is there.</strong> KVQuant and GEAR both ship custom CUDA kernels;</li>
+</ol>
+<p>   without fused dequant-matmul, the quantization/dequantization overhead eats the memory win. Production</p>
+<p>   stacks (vLLM, TensorRT-LLM) now support <strong>fp8 KV cache</strong> as the default safe setting — 2× smaller,</p>
+<p>   near-lossless, and hardware-accelerated on Hopper/Ada. 4-bit and below still require the research</p>
+<p>   kernels above.</p>
+<ol>
+<li><strong>Calibration matters at the low end.</strong> KVQuant calibrates key scales offline; value scales are computed</li>
+</ol>
+<p>   online. Skip calibration and 3-bit quality degrades sharply.</p>
+<h2>A practical decision guide</h2>
+<ul>
+<li><strong>Just want it to work, now:</strong> use <strong>fp8 KV cache</strong> in your serving framework. ~2× memory, hardware</li>
+</ul>
+<p>  accelerated, essentially lossless, zero custom code.</p>
+<ul>
+<li><strong>Need 4× memory and run consumer/Ada GPUs:</strong> <strong>KIVI at 4-bit</strong> is the safe, tuned-free choice.</li>
+<li><strong>Serving very long context (hundreds of K to millions of tokens):</strong> <strong>KVQuant</strong> — it is purpose-built</li>
+</ul>
+<p>  for the long-context regime and quantizes <em>before</em> RoPE to keep quality.</p>
+<ul>
+<li><strong>Pushing to 2-bit on complex generation:</strong> <strong>GEAR</strong> (or GEAR-L for the efficient variant), layered on</li>
+</ul>
+<p>  top of a base quantizer.</p>
+<h2>Reproducing the memory numbers</h2>
+<p>The table and chart above come from a 30-line script (<code>experiment.py</code>) using only the public Llama-3-8B</p>
+<p>spec. The core formula:</p>
+<pre><code><span class="k">def</span> <span class="fn">kv_bytes</span>(seq_len, batch, bits):
+    <span class="c"># 2 (K and V) * layers * kv_heads * head_dim * (bits/8) * seq * batch</span>
+    <span class="k">return</span> <span class="n">2</span> * <span class="n">32</span> * <span class="n">8</span> * <span class="n">128</span> * (bits / <span class="n">8</span>) * seq_len * batch
+
+<span class="fn">print</span>(<span class="fn">kv_bytes</span>(<span class="n">131072</span>, <span class="n">1</span>, <span class="n">16</span>) / 1e9)   <span class="c"># 17.18 GB  (fp16, single request, 128K)</span>
+<span class="fn">print</span>(<span class="fn">kv_bytes</span>(<span class="n">131072</span>, <span class="n">1</span>, <span class="n">4</span>)  / 1e9)   <span class="c"># 4.29 GB   (4-bit)</span></code></pre>
+<p>Run it and you get the figures in this post. They are not benchmark results — they are the deterministic</p>
+<p>memory accounting that tells you <em>whether the request fits at all</em>, which is the question KV-cache</p>
+<p>quantization exists to answer.</p>
+<h2>Takeaway</h2>
+<p>KV-cache quantization is the rare optimization that is both mathematically simple and empirically</p>
+<p>subtle. The win is real and large — <strong>4–8× memory reduction, 2–5× throughput</strong> — but it is earned by</p>
+<p>respecting the cache&#x27;s outlier structure, not by rounding harder. For most teams the right move today is</p>
+<p>fp8 in the serving stack; for the long-context frontier, KVQuant and GEAR show that 2–3-bit caches are no</p>
+<p>longer research curiosities but deployable.</p>
+<h2>References</h2>
+<ul>
+<li>Liu et al., <strong>KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache</strong> (ICML 2024).</li>
+</ul>
+<p>  <a href="https://arxiv.org/abs/2402.02750">arXiv:2402.02750</a> · <a href="https://github.com/jy-yuan/KIVI">github.com/jy-yuan/KIVI</a></p>
+<ul>
+<li>Hooper et al., <strong>KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization</strong></li>
+</ul>
+<p>  (NeurIPS 2024). <a href="https://arxiv.org/abs/2401.18079">arXiv:2401.18079</a> · <a href="https://github.com/SqueezeAILab/KVQuant">github.com/SqueezeAILab/KVQuant</a></p>
+<ul>
+<li>Kang et al., <strong>GEAR: An Efficient Error Reduction Framework for KV Cache Compression in LLM Inference</strong></li>
+</ul>
+<p>  (ICML 2024). <a href="https://arxiv.org/abs/2403.05527">arXiv:2403.05527</a> · <a href="https://github.com/opengear-project/GEAR">github.com/opengear-project/GEAR</a></p>
+<ul>
+<li>Kwon et al., <strong>vLLM / PagedAttention</strong> (SOSP 2023) — the system layer KV quantization slots into.</li>
+</ul>
+<p>  <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a></p></div></body></html>
