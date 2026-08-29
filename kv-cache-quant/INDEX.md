@@ -21,6 +21,8 @@ By the end you should be able to answer:
 - How to wire it into a real serving stack (vLLM / HuggingFace).
 - How to compute the cache size for *your* model in 30 lines of Python.
 
+![End-to-end KV-cache quantization workflow](assets/diagram_workflow.png?v=7)
+
 ## Hardware & Experiment Setup
 
 Before the theory, the actual rig the numbers below come from:
@@ -69,8 +71,6 @@ KV cache is shuffled from main memory into SRAM for every generated token (KIVI,
 
 The obvious move is uniform, per-token quantization. That's also the mistake. Here is the experiment, end
 to end:
-
-![End-to-end KV-cache quantization workflow](assets/diagram_workflow.png?v=7)
 
 I fake-quantized the captured KV cache at **2-bit and 4-bit** under four schemes, recomputed attention
 scores, and measured the error. The bar chart is the measured result:

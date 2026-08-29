@@ -29,7 +29,7 @@ th,td { border:1px solid #e2e2e2; padding:12px 16px; text-align:left; }
 th { background:#f4f6f8; }
 ul,ol { padding-left:22px; }
 li { margin:6px 0; }
-</style></head><body><div class="hero"><div class="k">LLM Inference · Triton Kernels</div><h1>I Wrote the Three Attention Kernels That Run LLM Inference — in Portable Triton, on a Free Colab T4</h1><p>from-scratch prefill · split-KV decode · paged KV-cache attention — validated vs PyTorch SDPA</p></div><div class="wrap"><p>KV-cache quantization is one of the highest-leverage knobs in modern LLM inference. As context windows</p>
+</style></head><body><div class="hero"><div class="k">LLM INFERENCE · KV-CACHE QUANTIZATION</div><h1>KV-Cache Quantization: I Ran the Experiments So You Don’t Have To</h1><p>real KV-cache quantization on Qwen2.5-0.5B · KIVI vs KVQuant vs GEAR · wired into a vLLM serving stack</p></div><div class="wrap"><p>KV-cache quantization is one of the highest-leverage knobs in modern LLM inference. As context windows</p>
 <p>stretch past 128K tokens and batch sizes climb, the Key-Value cache — not the model weights — becomes the</p>
 <p>dominant memory consumer, quietly turning serving into a memory-bound problem. Storing that cache in 4-bit</p>
 <p>or 2-bit cuts its footprint 4–8× with minimal quality loss, but naive rounding collapses attention rather</p>
@@ -47,6 +47,7 @@ li { margin:6px 0; }
 <li>How to wire it into a real serving stack (vLLM / HuggingFace).</li>
 <li>How to compute the cache size for <em>your</em> model in 30 lines of Python.</li>
 </ul>
+<figure><a href="assets/diagram_workflow.png?v=7" target="_blank"><img src="assets/diagram_workflow.png?v=7"></a><figcaption>Figure 1: End-to-end KV-cache quantization workflow</figcaption></figure>
 <h2>Hardware &amp; Experiment Setup</h2>
 <p>Before the theory, the actual rig the numbers below come from:</p>
 <ul>
@@ -57,14 +58,14 @@ li { margin:6px 0; }
 <li><strong>What we measured:</strong> relative attention-score error <code>‖A − Â‖ / ‖A‖</code> after quantizing the KV cache.</li>
 </ul>
 <p>No synthetic tensors, no &quot;trust me&quot; — the activations are the model&#x27;s own.</p>
-<figure><a href="assets/diagram_qwen_arch.png?v=7" target="_blank"><img src="assets/diagram_qwen_arch.png?v=7"></a></figure>
+<figure><a href="assets/diagram_qwen_arch.png?v=7" target="_blank"><img src="assets/diagram_qwen_arch.png?v=7"></a><figcaption>Figure 2: Complete architecture of the Qwen2.5-0.5B model used in this experiment</figcaption></figure>
 <h2>Component 1 — The cache is a tax that scales with tokens</h2>
 <p>Every transformer layer keeps the Key and Value vectors of every token it has seen, so attention doesn&#x27;t</p>
 <p>have to recompute them. That storage is:</p>
 <pre><code>KV_bytes = <span class="n">2</span> · n_layers · n_kv_heads · head_dim · bytes_per_elem · seq_len · batch</code></pre>
 <p>For <strong>Llama-3-8B</strong> (32 layers, 8 KV heads, head_dim 128) that&#x27;s <strong>128 KiB per token at fp16</strong>, and it</p>
 <p>grows linearly with both sequence length and batch. The picture below is the whole problem in one frame.</p>
-<figure><a href="assets/diagram_memory_wall.png?v=7" target="_blank"><img src="assets/diagram_memory_wall.png?v=7"></a></figure>
+<figure><a href="assets/diagram_memory_wall.png?v=7" target="_blank"><img src="assets/diagram_memory_wall.png?v=7"></a><figcaption>Figure 3: Why context length causes OOM: weights vs KV-cache memory growth</figcaption></figure>
 <table><thead><tr><th>Context (tokens)</th><th>fp16</th><th>8-bit</th><th>4-bit</th><th>2-bit</th></tr></thead><tbody><tr><td>4,096</td><td>0.54 GB</td><td>0.27 GB</td><td>0.13 GB</td><td>0.07 GB</td></tr><tr><td>8,192</td><td>1.07 GB</td><td>0.54 GB</td><td>0.27 GB</td><td>0.13 GB</td></tr><tr><td>32,768</td><td>4.29 GB</td><td>2.15 GB</td><td>1.07 GB</td><td>0.54 GB</td></tr><tr><td>131,072</td><td>17.18 GB</td><td>8.59 GB</td><td>4.29 GB</td><td>2.15 GB</td></tr></tbody></table>
 <p>Batch 64 requests at 32K: the fp16 cache alone is <strong>~275 GB</strong> — past any single GPU. Even 4-bit leaves</p>
 <p>~69 GB. This is why long-context serving is <strong>memory-bound</strong>: the GPU&#x27;s compute cores sit idle while the</p>
@@ -73,10 +74,9 @@ li { margin:6px 0; }
 <h2>Component 2 — I measured the trap myself</h2>
 <p>The obvious move is uniform, per-token quantization. That&#x27;s also the mistake. Here is the experiment, end</p>
 <p>to end:</p>
-<figure><a href="assets/diagram_workflow.png?v=7" target="_blank"><img src="assets/diagram_workflow.png?v=7"></a></figure>
 <p>I fake-quantized the captured KV cache at <strong>2-bit and 4-bit</strong> under four schemes, recomputed attention</p>
 <p>scores, and measured the error. The bar chart is the measured result:</p>
-<figure><a href="assets/real_attn_err.png?v=7" target="_blank"><img src="assets/real_attn_err.png?v=7"></a></figure>
+<figure><a href="assets/real_attn_err.png?v=7" target="_blank"><img src="assets/real_attn_err.png?v=7"></a><figcaption>Figure 4: Measured KV-cache quantization error on Qwen2.5-0.5B</figcaption></figure>
 <table><thead><tr><th>Scheme (bits)</th><th>2-bit attn error</th><th>4-bit attn error</th></tr></thead><tbody><tr><td>uniform (K,V per-token) — <strong>the naive one</strong></td><td><strong>0.786</strong></td><td>0.401</td></tr><tr><td>uniform (K,V per-channel)</td><td>0.623</td><td>0.215</td></tr><tr><td><strong>K per-channel, V per-token (KIVI)</strong></td><td><strong>0.623</strong></td><td><strong>0.215</strong></td></tr><tr><td>K per-token, V per-channel (wrong)</td><td>0.786</td><td>0.401</td></tr></tbody></table>
 <p>Two things jump out, and they match the literature:</p>
 <ol>
@@ -91,7 +91,7 @@ li { margin:6px 0; }
 <p>Why? Look at the distribution. Keys have a few <strong>fixed outlier channels</strong> (same channels, every token);</p>
 <p>values have no such pattern but are mixed by attention into the output. So keys want per-channel</p>
 <p>quantization, values want per-token. Uniform quantization ignores that and pays for it.</p>
-<figure><a href="assets/diagram_asymmetric.png?v=7" target="_blank"><img src="assets/diagram_asymmetric.png?v=7"></a></figure>
+<figure><a href="assets/diagram_asymmetric.png?v=7" target="_blank"><img src="assets/diagram_asymmetric.png?v=7"></a><figcaption>Figure 5: Asymmetric outlier structure: why per-token round() fails vs per-channel</figcaption></figure>
 <p>The whole asymmetric scheme in a dozen lines:</p>
 <pre><code><span class="k">def</span> <span class="fn">fake_quant</span>(x, bits, dim):
     qmax = <span class="n">2</span> ** bits - <span class="n">1</span>
@@ -105,8 +105,8 @@ V_q = <span class="fn">fake_quant</span>(V, <span class="n">2</span>, dim=<span 
 <p>Three papers define the frontier. They agree on the outlier structure and diverge on how hard they push</p>
 <p>the bit-width.</p>
 <table><thead><tr><th>Method</th><th>Scheme</th><th>Bits</th><th>Quality</th><th>Memory / throughput</th></tr></thead><tbody><tr><td><strong>KIVI</strong> (ICML&#x27;24)</td><td>per-channel K, per-token V; recent tokens kept fp16</td><td>2</td><td>~2% drop on Llama-2/Mistral (GSM8K); Falcon needs 4-bit</td><td>2.6× peak mem, 4× larger batch, <strong>2.35–3.47× throughput</strong></td></tr><tr><td><strong>KVQuant</strong> (NeurIPS&#x27;24)</td><td>pre-RoPE per-channel K, non-uniform, dense-and-sparse (1% outliers)</td><td>3</td><td><strong>&lt;0.1 perplexity drop</strong> (WikiText-2, C4)</td><td>4.8× compression; LLaMA-7B at <strong>1M ctx on 1× A100</strong>, 10M on 8× GPU; ~1.7× matvec speedup</td></tr><tr><td><strong>GEAR</strong> (ICML&#x27;24)</td><td>quantization + low-rank error + sparse outliers</td><td>2</td><td>near-lossless; up to <strong>24.4% over SOTA</strong> at 2-bit</td><td>2.39× peak mem, <strong>2.1–5.07× throughput</strong></td></tr></tbody></table>
-<figure><a href="assets/bench.png?v=7" target="_blank"><img src="assets/bench.png?v=7"></a></figure>
-<figure><a href="assets/diagram_schemes.png?v=7" target="_blank"><img src="assets/diagram_schemes.png?v=7"></a></figure>
+<figure><a href="assets/bench.png?v=7" target="_blank"><img src="assets/bench.png?v=7"></a><figcaption>Figure 6: Memory saved vs throughput at a glance</figcaption></figure>
+<figure><a href="assets/diagram_schemes.png?v=7" target="_blank"><img src="assets/diagram_schemes.png?v=7"></a><figcaption>Figure 7: How KIVI, KVQuant, and GEAR decompose the KV tensor</figcaption></figure>
 <ul>
 <li><strong>KIVI is the pragmatic default.</strong> Tuning-free, plug-and-play, ships as a HuggingFace wrapper. The</li>
 </ul>
@@ -126,7 +126,7 @@ V_q = <span class="fn">fake_quant</span>(V, <span class="n">2</span>, dim=<span 
 <h2>Component 4 — Serving architecture &amp; manifests</h2>
 <p>This isn&#x27;t a research curiosity you bolt on by hand — it slots into the paged-memory path every modern</p>
 <p>server already runs:</p>
-<figure><a href="assets/diagram_serving.png?v=7" target="_blank"><img src="assets/diagram_serving.png?v=7"></a></figure>
+<figure><a href="assets/diagram_serving.png?v=7" target="_blank"><img src="assets/diagram_serving.png?v=7"></a><figcaption>Figure 8: Serving layer: quantized KV blocks mapped to paged memory in vLLM</figcaption></figure>
 <p>For the long-context frontier, KVQuant and GEAR ship CUDA kernels that fuse dequant into the matmul —</p>
 <p>without that fusion, the quantization overhead eats the memory win. In practice you rarely write the kernel</p>
 <p>yourself; two drop-in paths:</p>
@@ -174,7 +174,7 @@ model = LlamaForCausalLM_KIVI<span class="at">.from_pretrained</span>(<span clas
 
 <span class="fn">print</span>(<span class="fn">kv_bytes</span>(<span class="n">131072</span>, <span class="n">1</span>, <span class="n">16</span>) / 1e9)   <span class="c"># 17.18 GB  (fp16, 1 req, 128K)</span>
 <span class="fn">print</span>(<span class="fn">kv_bytes</span>(<span class="n">131072</span>, <span class="n">1</span>, <span class="n">4</span>)  / 1e9)   <span class="c"># 4.29 GB   (4-bit)</span></code></pre>
-<figure><a href="assets/kv_memory.png?v=7" target="_blank"><img src="assets/kv_memory.png?v=7"></a></figure>
+<figure><a href="assets/kv_memory.png?v=7" target="_blank"><img src="assets/kv_memory.png?v=7"></a><figcaption>Figure 9: KV cache memory vs context length for Llama-3-8B</figcaption></figure>
 <p>Run it and you get the figures in this post. That&#x27;s the question KV-cache quantization exists to answer:</p>
 <p><em>does this request fit?</em></p>
 <h2>Takeaway</h2>
